@@ -1,5 +1,8 @@
 Revision history for Test-Dependencies
 
+0.11    Thu Dec 27 15:53:30 EST 2007
+        * tests no longer run under taint mode so that CPAN testers don't fail tests
+
 0.10    Thu Dec 27 03:28:17 EST 2007
         * let users choose which method of module usage checking to use
 
