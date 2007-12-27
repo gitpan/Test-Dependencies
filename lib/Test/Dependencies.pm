@@ -19,11 +19,11 @@ Test::Dependencies - Ensure that your Makefile.PL specifies all module dependenc
 
 =head1 VERSION
 
-Version 0.08
+Version 0.09
 
 =cut
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 =head1 SYNOPSIS
 
@@ -112,13 +112,20 @@ sub _get_modules_used_in {
   my @sourcefiles = _get_files_in(@dirs);
   my $perl = $^X;
   my %deps;
-  foreach my $file (@sourcefiles) {
+  foreach my $file (sort @sourcefiles) {
     my $taint = _taint_flag($file);
     my ($success, $error_code, $full_buf, $stdout_buf, $stderr_buf) =
       run(command => [$perl, $taint, '-MO=PerlReq', $file]);
     die "Could not compile '$file': error code: $error_code"
       unless $success;
-    foreach my $line (@$stdout_buf) {
+
+    # for some reason IPC::Run doesn't always split lines correctly
+    my @lines;
+    push @lines, split /\n/ foreach @$stdout_buf;
+
+    foreach my $line (@lines) {
+      chomp $line;
+      my $x = $line;
       $line =~ m/^perl\((.+)\)$/;
       # path2mod sucks, but the mod2path that B::PerlReq uses sucks, too
       $deps{path2mod($1)}++;
@@ -169,13 +176,12 @@ sub ok_dependencies {
   my %required = exists $meta->{requires} && defined $meta->{requires} ? %{$meta->{requires}} : ();
   my %build_required = exists $meta->{build_requires} ? %{$meta->{build_requires}} : ();
 
-  my @in_core;
-  
   foreach my $mod (sort keys %used) {
     my $first_in = Module::CoreList->first_release($mod);
     if (defined $first_in and $first_in <= 5.00803) {
+      $tb->ok(1, "run-time dependency '$mod' has been in core since before 5.8.3");
       delete $used{$mod};
-      push @in_core, $mod if exists $required{$mod};
+      delete $required{$mod};
       next;
     }
     if (defined $exclude_re && $mod =~ m/^($exclude_re)(::|$)/) {
@@ -190,8 +196,9 @@ sub ok_dependencies {
   foreach my $mod (sort keys %build_used) {
     my $first_in = Module::CoreList->first_release($mod);
     if (defined $first_in and $first_in <= 5.00803) {
+      $tb->ok(1, "build-time dependency '$mod' has been in core since before 5.8.3");
       delete $build_used{$mod};
-      push @in_core, $mod if exists $build_required{$mod};
+      delete $build_required{$mod};
       next;
     }
     if (defined $exclude_re && $mod =~ m/^($exclude_re)(::|$)/) {
@@ -203,10 +210,6 @@ sub ok_dependencies {
     delete $build_required{$mod};
   }  
 
-  foreach my $mod (sort @in_core) {
-    $tb->ok(0, "Required module $mod is in core");
-  }
-  
   foreach my $mod (sort keys %required) {
     $tb->ok(0, "$mod is not a run-time dependency");
   }
@@ -275,7 +278,7 @@ L<http://search.cpan.org/dist/Test-Dependencies>
 
 =head1 LICENCE AND COPYRIGHT
 
-    Copyright (c) 2006, Best Practical Solutions, LLC. All rights reserved.
+    Copyright (c) 2007, Best Practical Solutions, LLC. All rights reserved.
 
     This module is free software; you can redistribute it and/or modify it
     under the same terms as Perl itself. See perlartistic.
