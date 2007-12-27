@@ -3,12 +3,9 @@ package Test::Dependencies;
 use warnings;
 use strict;
 
-use B::PerlReq;
 use Carp;
 use File::Find::Rule;
-use IPC::Cmd qw/run/;
 use Module::CoreList;
-use PerlReq::Utils qw(path2mod);
 use YAML qw(LoadFile);
 
 use base 'Test::Builder::Module';
@@ -19,11 +16,11 @@ Test::Dependencies - Ensure that your Makefile.PL specifies all module dependenc
 
 =head1 VERSION
 
-Version 0.09
+Version 0.10
 
 =cut
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 
 =head1 SYNOPSIS
 
@@ -39,6 +36,44 @@ In your t/00-dependencies.t:
 Makes sure that all of the modules that are 'use'd are listed in the
 Makefile.PL as dependencies.
 
+=head1 OPTIONS
+
+You can pass options to the module via the 'use' line.  The available
+options are:
+
+=over 4
+
+=item exclude
+
+Specifies the list of namespaces for which it is ok not to have
+specified dependencies.
+
+=item style
+
+Specifies the style of module usage checking to use.  There are two
+valid values: "light" and "heavy".  The default is heavy.  The
+light style uses regular expressions to try and guess which modules
+are required.  It is fast, but can get confused by here-docs,
+multi-line strings, data sections, etc.  The heavy style actually
+compiles the file and asks perl which modules were used.  It is
+slower than the light style, but much more accurate.  If you have a
+very large project and you don't want to wait for the heavy style
+every time you run "make test," you might want to try the light
+style or look into the overrides below.
+
+Whether a style is specified or not, the style used can be overriden
+by the environment variable TDSTYLE.  This is useful, for example, if
+you want the heavy style to be used normally, but don't want to take
+the time checking dependencies on your smoke test server.
+
+Example usage:
+
+  use Test::Dependencies
+    exclude => ['Test::Dependencies'],
+    style => 'light';
+
+=back
+
 =cut
 
 our @EXPORT = qw/ok_dependencies/;
@@ -46,26 +81,45 @@ our @EXPORT = qw/ok_dependencies/;
 our $exclude_re;
 
 sub import {
-  my $package = $_[0];
+  my $package = shift;
+  my %args = @_;
   my $callerpack = caller;
   my $tb = __PACKAGE__->builder;
   $tb->exported_to($callerpack);
   $tb->no_plan;
 
-  if (scalar @_ == 3) {
-    # package name, literal exclude, excluded namespaces
-    my $exclude = $_[2];
-    foreach my $namespace (@$exclude) {
+  if (defined $args{exclude}) {
+    foreach my $namespace (@{$args{exclude}}) {
       croak "$namespace is not a valid namespace"
         unless $namespace =~ m/^(?:(?:\w+::)|)+\w+$/;
     }
-    $exclude_re = join '|', @$exclude;
-  } elsif (scalar @_ != 1) {
-    croak "wrong number of arguments while using Test::Dependencies: " . join ' ', @_;
+    $exclude_re = join '|', @{$args{exclude}};
   }
+
+  if (defined $ENV{TDSTYLE}) {
+    _choose_style($ENV{TDSTYLE});
+  } else {
+    if (defined $args{style}) {
+      _choose_style($args{style});
+    } else {
+      _choose_style('heavy');
+    }
+  }
+
   $package->export_to_level(1, '', qw/ok_dependencies/);
 }
 
+sub _choose_style {
+  my $style = shift;
+  if (lc $style eq 'light') {
+    eval 'use Test::Dependencies::Light';
+  } elsif (lc $style eq 'heavy') {
+    eval 'use Test::Dependencies::Heavy';
+  } else {
+    carp "Unknown style: '", $style, "'";
+  }
+}
+    
 sub _get_files_in {
   my @dirs = @_;
   my $rule = File::Find::Rule->new;
@@ -92,54 +146,27 @@ sub _get_files_in {
   return $rule->in(grep {-e $_} @dirs);
 }
 
-sub _taint_flag {
-  my $filename = shift;
-  open FILE, $filename
-    or warn "Could not open '$filename': $!";
-  my $shebang = <FILE>;
-  close FILE;
-  if (defined $shebang) {
-    chomp $shebang;
-    if ($shebang =~ m/^#!.*perl.*-T/) {
-      return '-T';
-    }
-  }
-  return '';
-}
-
-sub _get_modules_used_in {
+sub _get_modules_used_in_dir {
   my @dirs = @_;
   my @sourcefiles = _get_files_in(@dirs);
-  my $perl = $^X;
-  my %deps;
+  my @modules;
+
   foreach my $file (sort @sourcefiles) {
-    my $taint = _taint_flag($file);
-    my ($success, $error_code, $full_buf, $stdout_buf, $stderr_buf) =
-      run(command => [$perl, $taint, '-MO=PerlReq', $file]);
-    die "Could not compile '$file': error code: $error_code"
-      unless $success;
-
-    # for some reason IPC::Run doesn't always split lines correctly
-    my @lines;
-    push @lines, split /\n/ foreach @$stdout_buf;
-
-    foreach my $line (@lines) {
-      chomp $line;
-      my $x = $line;
-      $line =~ m/^perl\((.+)\)$/;
-      # path2mod sucks, but the mod2path that B::PerlReq uses sucks, too
-      $deps{path2mod($1)}++;
+    my $ret = get_modules_used_in_file($file);
+    if (! defined $ret) {
+      die "Could not determine modules used in '$file'";
     }
+    push @modules, @$ret;
   }
-  return keys %deps;
+  return @modules;
 }
 
 sub _get_used {
-  return _get_modules_used_in(qw/bin lib/);
+  return _get_modules_used_in_dir(qw/bin lib/);
 }
 
 sub _get_build_used {
-  return _get_modules_used_in(qw/t/);
+  return _get_modules_used_in_dir(qw/t/);
 }
 
 =head1 EXPORTED FUNCTIONS
