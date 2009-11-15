@@ -16,11 +16,11 @@ Test::Dependencies - Ensure that your Makefile.PL specifies all module dependenc
 
 =head1 VERSION
 
-Version 0.11
+Version 0.12
 
 =cut
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 =head1 SYNOPSIS
 
@@ -201,6 +201,9 @@ sub ok_dependencies {
   }
   my $meta = LoadFile('META.yml') or die 'Could not load META.YML';
   my %required = exists $meta->{requires} && defined $meta->{requires} ? %{$meta->{requires}} : ();
+  # "perl" is not a real dependency, but people often specify a
+  # minimum perl version in their META.yml
+  delete $required{'perl'};
   my %build_required = exists $meta->{build_requires} ? %{$meta->{build_requires}} : ();
 
   foreach my $mod (sort keys %used) {

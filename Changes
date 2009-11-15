@@ -1,5 +1,9 @@
 Revision history for Test-Dependencies
 
+0.12    Sun Nov 15 01:01:20 CST 2009
+        * don't report "perl" being a required dependency when a
+          minimum perl version is listed in META.yml
+
 0.11    Thu Dec 27 15:53:30 EST 2007
         * tests no longer run under taint mode so that CPAN testers don't fail tests
 
