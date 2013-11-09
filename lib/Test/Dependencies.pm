@@ -1,341 +1,314 @@
 package Test::Dependencies;
+# ABSTRACT: Test that dependencies are properly listed for your dist
 
-use warnings;
 use strict;
+use warnings;
 
-use Carp;
-use File::Find::Rule;
+use Test::More;
+
+use Test::Pod; # all_pod_files
+
+use CPAN::Meta;
 use Module::CoreList;
-use YAML qw(LoadFile);
 
-use base 'Test::Builder::Module';
+use PPI;
+use Perl::PrereqScanner;
+
+use Carp qw(croak);
+use Cwd;
+
+use Data::Dumper;
+
+use version 0.77;
+
+require Exporter;
+our @ISA = qw(Exporter);
+our @EXPORT = qw(all_dependencies_ok);
+
+sub all_dependencies_ok {
+	if (@_ % 2) {
+		croak("Bad options, HASH expected");
+	}
+
+	my (%opt) = @_;
+
+	my $corelist;
+
+	# Explicitly ignored files
+	my %ignore;
+
+	if ($corelist = delete $opt{corelist}) {
+		if (!version::is_lax($corelist)) {
+			croak("Bad version passed to 'corelist'");
+		}
+
+		$corelist = version->parse($corelist);
+	}
+
+	if ($opt{ignore}) {
+		if (ref $opt{ignore} ne 'ARRAY') {
+			croak("Option 'ignore' must be an ARRAYREF");
+		}
+
+		%ignore = map { $_ => 1 } @{ delete $opt{ignore} };	
+	}
+
+	# Run as an author test by default unless someone explicitly
+	# asks otherwise
+	if (! delete $opt{force}) {
+		require Test::DescribeMe;
+		Test::DescribeMe->import('author');
+	}	
+
+	if (%opt) {
+		croak("Unknown options: " . Dumper(\%opt));
+	}
+
+	my $meta = get_meta(getcwd) or die "Failed to find our meta modules\n";
+	my $prereqs = $meta->effective_prereqs;
+
+	my %listed;
+
+	# Track requirements listed for different phases
+	for my $phase (qw(configure build test runtime)) {
+		my $reqs = $prereqs->requirements_for($phase, 'requires');
+
+		$listed{$phase}{$_} = 1 for $reqs->required_modules;
+		$listed{all}{$_} = 1 for $reqs->required_modules;
+	}
+
+	# Accumulate configure into build
+	$listed{build}{$_} = 1 for keys %{ $listed{configure} };
+
+	# There isn't really a test_requires (it's in build)
+	$listed{build}{$_} = 1 for keys %{ $listed{test} };
+
+	# Find all of our files
+	my @files = all_pod_files('.');
+
+	# list of our files
+	my %our;
+
+	# First, assemble list of our packages to ignore them
+	for my $f (@files) {
+		next if $f =~ /\.pod$/; # Skip pod
+
+		# Load a Document from a file
+		my $document = PPI::Document->new($f);
+
+		# Get the name of the main package
+		my $pkg = eval { $document->find_first('PPI::Statement::Package')->namespace; };
+		if ($pkg) {
+			$our{$pkg} = 1;
+		}
+	}
+
+	# Scan them!
+	my $scanner = Perl::PrereqScanner->new();
+
+	my %done;
+
+	for my $f (@files) {
+		next if $f =~ /\.pod$/; # Skip pod
+
+		ok(1, "Checking dependencies from $f");
+
+		my $prereqs = $scanner->scan_file($f);
+
+		for my $req ($prereqs->required_modules) {
+			my $ok;
+			my $why = '';
+
+			if ($ignore{$req}) {
+				$ok = 1;
+				$why = ' [ignored]';
+
+			} elsif ($our{$req}) {
+				$ok = 1;
+				$why = ' [internal dependency]';
+
+			} else {
+				my $phase = determine_phase($f);
+
+				if ($phase) {
+					next if $done{$phase}{$req}++;
+
+					# set this on success/error if detected phase
+					$why = " [listed in correct phase ${phase}_requires]";
+
+					if ($listed{$phase}{$req}) {
+						$ok = 1;
+					}
+				} elsif ($listed{all}{$req}) {
+					$ok = 1;
+					$why = " [listed as a requirement (could not determine phase)]";
+				}
+			}
+
+			# Hmm not found, should we ignore core modules?
+			if (!$ok && $corelist) {
+				next if $done{corelist}{$req}++;
+
+				my $fr = Module::CoreList->first_release($req);
+
+				if ($fr && version->parse($fr) <= $corelist) {
+					$ok = 1;
+					$why = ' [corelist]';
+				}
+			}
+
+
+			ok($ok, "[$f] Module '$req' is listed in prereqs$why");
+		}
+	}		
+
+	ok(1, "Finished");
+
+	done_testing;
+}
+
+sub get_meta {
+	my ($root) = @_;
+
+	# Look for MYMETA.* and then see if we can parse at least one of
+	# them. These should have been freshly built during the build
+	# phase and contain our requirements.
+	opendir(my $dhand, $root) or die "Failed to open $root: $!\n";
+
+	my @meta = grep { /^MYMETA\./ } readdir($dhand);
+
+	closedir($dhand);
+
+	my $meta;
+
+	my %errors;
+
+	for my $m (@meta) {
+		eval { $meta = CPAN::Meta->load_file($m) };
+		if (!$@) {
+			return $meta;
+		}
+		$errors{$m} = $@;
+	}
+
+	die "Failed to parse MYMETA files: " . Dumper(\%errors);
+}
+
+# Try to guess which phase a file is in. (configure runtime build test)
+# Fail? return nothing. This could be better
+sub determine_phase {
+	my ($f) = @_;
+
+	my $phase;
+
+	if ($f =~ /\.t/) {
+		$phase = 'build';
+
+	} elsif ($f =~ /\.p(m|l)/ && $f !~ m#(\.t/|/t/)#) {
+		$phase = 'runtime';
+
+	} elsif ($f =~ m#(\.bin/|/bin/)#) {
+		$phase = 'runtime';
+
+	} elsif ($f =~ /(Build\.PL|Makefile\.PL)/) {
+		$phase = 'configure';
+	}
+
+	# Others???
+
+	return $phase;
+}
+
+1;
+__END__
 
 =head1 NAME
 
-Test::Dependencies - Ensure that your Makefile.PL specifies all module dependencies
-
-=head1 VERSION
-
-Version 0.12
-
-=cut
-
-our $VERSION = '0.12';
+Test::Dependencies - Test that dependencies are properly listed for your dist
 
 =head1 SYNOPSIS
 
-In your t/00-dependencies.t:
+Check that your module lists all external depdencies, including those that are 
+part of the Perl core:
 
-    use Test::Dependencies exclude =>
-      [qw/ Your::Namespace Some::Other::Namespace /];
+  use Test::Dependencies;
+  all_dependencies_ok();
 
-    ok_dependencies();
+Ignore dependencies that are listed as core for version 5.8.8 and above:
+
+  all_dependencies_ok(corelist => '5.8.8');
+
+Ignore specific dependencies:
+
+  all_dependencies_ok(ignore => [qw(Foo Bar::Baz)]);
+
+Force tests to be run (since it only expects to be run as an author test by 
+default):
+
+  all_dependencies_ok(force => 1);
 
 =head1 DESCRIPTION
 
-Makes sure that all of the modules that are 'use'd are listed in the
-Makefile.PL as dependencies.
+This module provides an author test (by default it will only run if author 
+testing was explicitly requested) to CPAN distributions that will check that 
+all modules used (detected by L<Perl::PrereqScanner>) in tests, utilities, 
+and packages are listed in the distribution's dependencies.
 
-=head1 OPTIONS
+It does this by scanning the distribution directory tree and comparing the 
+requested modules to the generated C<MYMETA.*> that were created at build time 
+for the distribution being tested.
 
-You can pass options to the module via the 'use' line.  The available
-options are:
+Note that this does NOT detect minimum version requirements.
+
+=head2 Methods
+
+=head3 all_dependencies_ok
+
+  all_dependencies_ok(%options);
+
+Basic usage is (in some .t on its own):
+
+  use Test::Dependencies;
+  all_dependencies_ok();
+
+This will check that B<any> module being loaded B<only by files in the 
+distribution> are listed in C<MYMETA.*>, including those that are part of the 
+Perl core. (It's good form to list core modules as dependencies as its possible 
+they may be evicted in the future.)
+
+The following options may be used to control the behavior:
 
 =over 4
 
-=item exclude
+=item B<* force>
 
-Specifies the list of namespaces for which it is ok not to have
-specified dependencies.
+  all_dependencies_ok(force => 1);
 
-=item style
+Set this to true to force the tests to run, even if author testing isn't 
+requested. This is almost certainly a bad idea since it's up to the author to 
+ensure dependencies are listed properly before putting a dist on CPAN.
 
-Specifies the style of module usage checking to use.  There are two
-valid values: "light" and "heavy".  The default is heavy.  The
-light style uses regular expressions to try and guess which modules
-are required.  It is fast, but can get confused by here-docs,
-multi-line strings, data sections, etc.  The heavy style actually
-compiles the file and asks perl which modules were used.  It is
-slower than the light style, but much more accurate.  If you have a
-very large project and you don't want to wait for the heavy style
-every time you run "make test," you might want to try the light
-style or look into the overrides below.
+=item B<* ignore>
 
-Whether a style is specified or not, the style used can be overriden
-by the environment variable TDSTYLE.  This is useful, for example, if
-you want the heavy style to be used normally, but don't want to take
-the time checking dependencies on your smoke test server.
+  all_dependencies_ok(ignore => [qw(Some::Module Some::Other::Module)]);
 
-Example usage:
+Explicilty ignore failures of certain modules. This is also almost certainly a 
+bad idea, but who am I to judge?
 
-  use Test::Dependencies
-    exclude => ['Test::Dependencies'],
-    style => 'light';
+=item B<* corelist>
+
+  all_dependencies_ok(corelist => '5.8.8');
+
+This will cause all modules that are listed as being a part of the Perl core 
+from 5.8.8 and up. Note that this doesn't presently check whether or not its 
+SINCE been deprecated, which is almost certainly a bug. TODO: Fix bug.
+
+The versions can be anything that L<version/"is_lax"> accepts.
 
 =back
+
+=head1 AUTHOR
+
+Matthew Horsfall (alh) - <WolfSage@gmail.com>
 
 =cut
-
-our @EXPORT = qw/ok_dependencies/;
-
-our $exclude_re;
-
-sub import {
-  my $package = shift;
-  my %args = @_;
-  my $callerpack = caller;
-  my $tb = __PACKAGE__->builder;
-  $tb->exported_to($callerpack);
-  $tb->no_plan;
-
-  if (defined $args{exclude}) {
-    foreach my $namespace (@{$args{exclude}}) {
-      croak "$namespace is not a valid namespace"
-        unless $namespace =~ m/^(?:(?:\w+::)|)+\w+$/;
-    }
-    $exclude_re = join '|', @{$args{exclude}};
-  }
-
-  if (defined $ENV{TDSTYLE}) {
-    _choose_style($ENV{TDSTYLE});
-  } else {
-    if (defined $args{style}) {
-      _choose_style($args{style});
-    } else {
-      _choose_style('heavy');
-    }
-  }
-
-  $package->export_to_level(1, '', qw/ok_dependencies/);
-}
-
-sub _choose_style {
-  my $style = shift;
-  if (lc $style eq 'light') {
-    eval 'use Test::Dependencies::Light';
-  } elsif (lc $style eq 'heavy') {
-    eval 'use Test::Dependencies::Heavy';
-  } else {
-    carp "Unknown style: '", $style, "'";
-  }
-}
-    
-sub _get_files_in {
-  my @dirs = @_;
-  my $rule = File::Find::Rule->new;
-  $rule->or($rule->new
-                 ->directory
-                 ->name('.svn')
-                 ->prune
-                 ->discard,
-            $rule->new
-                 ->directory
-                 ->name('CVS')
-                 ->prune
-                 ->discard,
-            $rule->new
-                 ->name(qr/~$/)
-                 ->discard,
-            $rule->new
-                 ->name(qr/\.pod$/)
-                 ->discard,
-            $rule->new
-                 ->not($rule->new->file)
-                 ->discard,
-            $rule->new);
-  return $rule->in(grep {-e $_} @dirs);
-}
-
-sub _get_modules_used_in_dir {
-  my @dirs = @_;
-  my @sourcefiles = _get_files_in(@dirs);
-  my @modules;
-
-  foreach my $file (sort @sourcefiles) {
-    my $ret = get_modules_used_in_file($file);
-    if (! defined $ret) {
-      die "Could not determine modules used in '$file'";
-    }
-    push @modules, @$ret;
-  }
-  return @modules;
-}
-
-sub _get_used {
-  return _get_modules_used_in_dir(qw/bin lib/);
-}
-
-sub _get_build_used {
-  return _get_modules_used_in_dir(qw/t/);
-}
-
-=head1 EXPORTED FUNCTIONS
-
-=head2 ok_dependencies
-
-This should be the only test called in the test file.  It scans
-bin/ and lib/ for module usage and t/ for build usage.  It will
-then test that all modules used are listed as required in
-Makefile.PL, all modules used in t/ are listed as build required,
-that all modules listed are actually used, and that modules that
-are listed are not in the core list.
-
-=cut
-
-sub ok_dependencies {
-  my $tb = __PACKAGE__->builder;
-  my %used = map { $_ => 1 } _get_used;
-  my %build_used = map { $_ => 1 } _get_build_used;
-
-  # remove modules from build deps if they are hard deps
-  foreach my $mod (keys %used) {
-    delete $build_used{$mod} if exists $build_used{$mod};
-  }
-
-  if (-r 'META.yml') {
-    $tb->ok(1, 'META.yml is present and readable');
-  } else {
-    $tb->ok(0, 'META.yml is present and readable');
-    $tb->diag("You seem to be missing a META.yml.  I can't check which dependencies you've declared without it\n");
-    return;
-  }
-  my $meta = LoadFile('META.yml') or die 'Could not load META.YML';
-  my %required = exists $meta->{requires} && defined $meta->{requires} ? %{$meta->{requires}} : ();
-  # "perl" is not a real dependency, but people often specify a
-  # minimum perl version in their META.yml
-  delete $required{'perl'};
-  my %build_required = exists $meta->{build_requires} ? %{$meta->{build_requires}} : ();
-
-  foreach my $mod (sort keys %used) {
-    my $first_in = Module::CoreList->first_release($mod);
-    if (defined $first_in and $first_in <= 5.00803) {
-      $tb->ok(1, "run-time dependency '$mod' has been in core since before 5.8.3");
-      delete $used{$mod};
-      delete $required{$mod};
-      next;
-    }
-    if (defined $exclude_re && $mod =~ m/^($exclude_re)(::|$)/) {
-      delete $used{$mod};
-      next;
-    }
-    $tb->ok(exists $required{$mod}, "requires('$mod') in Makefile.PL");
-    delete $used{$mod};
-    delete $required{$mod};
-  }
-
-  foreach my $mod (sort keys %build_used) {
-    my $first_in = Module::CoreList->first_release($mod);
-    if (defined $first_in and $first_in <= 5.00803) {
-      $tb->ok(1, "build-time dependency '$mod' has been in core since before 5.8.3");
-      delete $build_used{$mod};
-      delete $build_required{$mod};
-      next;
-    }
-    if (defined $exclude_re && $mod =~ m/^($exclude_re)(::|$)/) {
-      delete $build_used{$mod};
-      next;
-    }
-    $tb->ok(exists $build_required{$mod}, "build_requires('$mod') in Makefile.PL");
-    delete $build_used{$mod};
-    delete $build_required{$mod};
-  }  
-
-  foreach my $mod (sort keys %required) {
-    $tb->ok(0, "$mod is not a run-time dependency");
-  }
-
-  foreach my $mod (sort keys %build_required) {
-    $tb->ok(0, "$mod is not a build-time dependency");
-  }
-
-}
-
-=head1 AUTHORS
-
-=over 4
-
-=item * Jesse Vincent C<< <jesse at bestpractical.com> >>
-
-=item * Alex Vandiver C<< <alexmv at bestpractical.com> >>
-
-=item * Zev Benjamin C<< <zev at cpan.org> >>
-
-=back
-
-=head1 BUGS
-
-=over 4
-
-=item * Test::Dependencies does not track module version requirements.
-
-=item * Perl version for "already in core" test failures is hardcoded.
-
-=back
-
-Please report any bugs or feature requests to
-C<bug-test-dependencies at rt.cpan.org>, or through the web interface at
-L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Test-Dependencies>.
-I will be notified, and then you'll automatically be notified of progress on
-your bug as I make changes.
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc Test::Dependencies
-
-You can also look for information at:
-
-=over 4
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Test-Dependencies>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Test-Dependencies>
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Test-Dependencies>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Test-Dependencies>
-
-=back
-
-=head1 LICENCE AND COPYRIGHT
-
-    Copyright (c) 2007, Best Practical Solutions, LLC. All rights reserved.
-
-    This module is free software; you can redistribute it and/or modify it
-    under the same terms as Perl itself. See perlartistic.
-
-    DISCLAIMER OF WARRANTY
-
-    BECAUSE THIS SOFTWARE IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY
-    FOR THE SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW. EXCEPT WHEN
-    OTHERWISE STATED IN WRITING THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES
-    PROVIDE THE SOFTWARE "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER
-    EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE
-    ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH
-    YOU. SHOULD THE SOFTWARE PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL
-    NECESSARY SERVICING, REPAIR, OR CORRECTION.
-
-    IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
-    WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR
-    REDISTRIBUTE THE SOFTWARE AS PERMITTED BY THE ABOVE LICENCE, BE LIABLE
-    TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL, OR
-    CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE
-    SOFTWARE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING
-    RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A
-    FAILURE OF THE SOFTWARE TO OPERATE WITH ANY OTHER SOFTWARE), EVEN IF
-    SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
-    DAMAGES.
-
-=cut
-
-1;
